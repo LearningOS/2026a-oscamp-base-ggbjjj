@@ -25,6 +25,8 @@ unsafe impl<T: Send> Send for SpinLock<T> {}
 /// Automatically releases the lock when SpinGuard is dropped.
 pub struct SpinGuard<'a, T> {
     lock: &'a SpinLock<T>,
+    // A shared guard must not expose a non-Sync T to several threads.
+    _borrow: core::marker::PhantomData<&'a mut T>,
 }
 
 impl<T> SpinLock<T> {
@@ -41,7 +43,17 @@ impl<T> SpinLock<T> {
     pub fn lock(&self) -> SpinGuard<'_, T> {
         // TODO: Spin-wait to acquire lock
         // TODO: Return SpinGuard { lock: self }
-        todo!()
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        SpinGuard {
+            lock: self,
+            _borrow: core::marker::PhantomData,
+        }
     }
 }
 
@@ -51,7 +63,8 @@ impl<T> Deref for SpinGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // SAFETY: This live guard owns the lock, so no competing mutation can occur.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -59,7 +72,8 @@ impl<T> Deref for SpinGuard<'_, T> {
 // Return &mut T
 impl<T> DerefMut for SpinGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        // SAFETY: The guard owns the lock and is exclusively borrowed here.
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -67,7 +81,7 @@ impl<T> DerefMut for SpinGuard<'_, T> {
 // Set lock.locked to false (Release ordering)
 impl<T> Drop for SpinGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        self.lock.locked.store(false, Ordering::Release);
     }
 }
 

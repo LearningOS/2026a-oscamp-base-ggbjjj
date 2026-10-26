@@ -23,7 +23,9 @@
 //!   until the writer runs.
 //!
 //! ## State (single atomic)
-//! We use one `AtomicU32`: low bits = reader count, two flags = writer holding / writer waiting.
+//! We use one `AtomicU32`: 15 reader-count bits, 15 waiting-writer-count bits,
+//! and two flags for a writer holding / writers waiting. Counting every waiter
+//! preserves writer priority even when several writers are queued.
 //! All logic is implemented with compare_exchange and load/store; no use of `std::sync::RwLock`.
 
 use std::cell::UnsafeCell;
@@ -31,7 +33,9 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Maximum number of concurrent readers (fits in state bits).
-const READER_MASK: u32 = (1 << 30) - 1;
+const READER_MASK: u32 = (1 << 15) - 1;
+const WAITER_INCREMENT: u32 = 1 << 15;
+const WAITER_MASK: u32 = READER_MASK << 15;
 /// Bit set when a writer holds the lock.
 const WRITER_HOLDING: u32 = 1 << 30;
 /// Bit set when at least one writer is waiting (writer-priority: block new readers).
@@ -63,19 +67,66 @@ impl<T> RwLock<T> {
     /// 4. Try compare_exchange(s, s + 1, AcqRel, Acquire); on success return RwLockReadGuard { lock: self }.
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         // TODO
-        todo!()
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & (WRITER_HOLDING | WRITER_WAITING) != 0 || state & READER_MASK == READER_MASK
+            {
+                core::hint::spin_loop();
+                continue;
+            }
+            if self
+                .state
+                .compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return RwLockReadGuard { lock: self };
+            }
+        }
     }
 
     /// Acquire the write lock. Blocks until no readers and no other writer.
     ///
     /// TODO: Implement write lock acquisition (writer-priority)
-    /// 1. Set WRITER_WAITING first: fetch_or(WRITER_WAITING, Release) so new readers will block.
-    /// 2. In a loop: load state; if any readers (READER_MASK) or WRITER_HOLDING, spin_loop and continue.
-    /// 3. Try compare_exchange(WRITER_WAITING, WRITER_HOLDING, ...) to take the lock; or compare_exchange(0, WRITER_HOLDING, ...) if a writer just released.
-    /// 4. On success return RwLockWriteGuard { lock: self }.
+    /// 1. Register a waiting writer with CAS and set WRITER_WAITING to block new readers.
+    /// 2. Spin while readers or another writer hold the lock.
+    /// 3. With CAS, remove this waiter and set WRITER_HOLDING. Keep WRITER_WAITING
+    ///    set until every queued writer has acquired the lock.
+    /// 4. Return an RAII write guard on success.
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
         // TODO
-        todo!()
+        // Register this writer in the same atomic state before waiting for readers.
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & WAITER_MASK == WAITER_MASK {
+                core::hint::spin_loop();
+                continue;
+            }
+            let waiting = (state + WAITER_INCREMENT) | WRITER_WAITING;
+            if self
+                .state
+                .compare_exchange_weak(state, waiting, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+        loop {
+            let state = self.state.load(Ordering::Acquire);
+            if state & (READER_MASK | WRITER_HOLDING) == 0 {
+                let mut acquired = (state - WAITER_INCREMENT) | WRITER_HOLDING;
+                if acquired & WAITER_MASK == 0 {
+                    acquired &= !WRITER_WAITING;
+                }
+                if self
+                    .state
+                    .compare_exchange_weak(state, acquired, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    return RwLockWriteGuard { lock: self };
+                }
+            }
+            core::hint::spin_loop();
+        }
     }
 }
 
@@ -90,7 +141,8 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // SAFETY: A read guard keeps writers out; all concurrent guards only read.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -98,7 +150,7 @@ impl<T> Deref for RwLockReadGuard<'_, T> {
 // Decrement reader count: self.lock.state.fetch_sub(1, Ordering::Release)
 impl<T> Drop for RwLockReadGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        self.lock.state.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -113,7 +165,8 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        todo!()
+        // SAFETY: A write guard owns exclusive access to the protected data.
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -121,15 +174,19 @@ impl<T> Deref for RwLockWriteGuard<'_, T> {
 // Return mutable reference: unsafe { &mut *self.lock.data.get() }
 impl<T> DerefMut for RwLockWriteGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        todo!()
+        // SAFETY: Both the write lock and this guard borrow are exclusive.
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
 // TODO: Implement Drop for RwLockWriteGuard
-// Clear writer bits so lock is free: self.lock.state.fetch_and(!(WRITER_HOLDING | WRITER_WAITING), Ordering::Release)
+// Clear WRITER_HOLDING with Release, preserving any queued writers.
 impl<T> Drop for RwLockWriteGuard<'_, T> {
     fn drop(&mut self) {
-        todo!()
+        // Keep queued writers and their waiting flag, so new readers cannot barge in.
+        self.lock
+            .state
+            .fetch_and(!WRITER_HOLDING, Ordering::Release);
     }
 }
 

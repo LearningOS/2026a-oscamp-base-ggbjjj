@@ -27,7 +27,11 @@
 pub unsafe extern "C" fn my_memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     // TODO: Implement memcpy
     // Hint: read bytes from src one by one and write to dst
-    todo!()
+    for index in 0..n {
+        // SAFETY: The caller provides valid, non-overlapping regions of n bytes.
+        unsafe { dst.add(index).write(src.add(index).read()) };
+    }
+    dst
 }
 
 /// Set `n` bytes starting at `dst` to the value `c`.
@@ -39,7 +43,11 @@ pub unsafe extern "C" fn my_memcpy(dst: *mut u8, src: *const u8, n: usize) -> *m
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_memset(dst: *mut u8, c: u8, n: usize) -> *mut u8 {
     // TODO: Implement memset
-    todo!()
+    for index in 0..n {
+        // SAFETY: Each byte is within the caller's writable region.
+        unsafe { dst.add(index).write(c) };
+    }
+    dst
 }
 
 /// Copy `n` bytes from `src` to `dst`, correctly handling overlapping memory.
@@ -52,7 +60,18 @@ pub unsafe extern "C" fn my_memset(dst: *mut u8, c: u8, n: usize) -> *mut u8 {
 pub unsafe extern "C" fn my_memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     // TODO: Implement memmove
     // Hint: when dst > src and regions overlap, copy backwards (from end to start)
-    todo!()
+    if (dst as usize) > (src as usize) {
+        for index in (0..n).rev() {
+            // SAFETY: Copying backwards preserves unread bytes when shifting right.
+            unsafe { dst.add(index).write(src.add(index).read()) };
+        }
+    } else {
+        for index in 0..n {
+            // SAFETY: Copying forwards preserves unread bytes when shifting left.
+            unsafe { dst.add(index).write(src.add(index).read()) };
+        }
+    }
+    dst
 }
 
 /// Return the length of a null-terminated byte string, excluding the trailing null.
@@ -62,7 +81,12 @@ pub unsafe extern "C" fn my_memmove(dst: *mut u8, src: *const u8, n: usize) -> *
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_strlen(s: *const u8) -> usize {
     // TODO: Implement strlen
-    todo!()
+    let mut length = 0;
+    // SAFETY: The caller guarantees a readable string including its terminating zero.
+    while unsafe { s.add(length).read() } != 0 {
+        length += 1;
+    }
+    length
 }
 
 /// Compare two null-terminated byte strings.
@@ -77,7 +101,15 @@ pub unsafe extern "C" fn my_strlen(s: *const u8) -> usize {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn my_strcmp(s1: *const u8, s2: *const u8) -> i32 {
     // TODO: Implement strcmp
-    todo!()
+    let mut index = 0;
+    loop {
+        // SAFETY: Both strings are readable through their terminating zero bytes.
+        let (left, right) = unsafe { (s1.add(index).read(), s2.add(index).read()) };
+        if left != right || left == 0 {
+            return i32::from(left) - i32::from(right);
+        }
+        index += 1;
+    }
 }
 
 // ============================================================

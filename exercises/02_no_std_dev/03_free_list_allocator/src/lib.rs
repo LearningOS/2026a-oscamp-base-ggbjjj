@@ -48,6 +48,8 @@ struct FreeBlock {
 pub struct FreeListAllocator {
     heap_start: usize,
     heap_end: usize,
+    /// Serializes whole list operations, including non-test no_std builds.
+    list_locked: core::sync::atomic::AtomicBool,
     /// Bump pointer: unallocated region starts here
     bump_next: core::sync::atomic::AtomicUsize,
     /// Free list head (protected by Mutex in test, UnsafeCell otherwise)
@@ -73,6 +75,7 @@ impl FreeListAllocator {
         Self {
             heap_start,
             heap_end,
+            list_locked: core::sync::atomic::AtomicBool::new(false),
             bump_next: core::sync::atomic::AtomicUsize::new(heap_start),
             #[cfg(test)]
             free_list: std::sync::Mutex::new(null_mut()),
@@ -102,6 +105,28 @@ impl FreeListAllocator {
     }
 }
 
+struct FreeListGuard<'a>(&'a core::sync::atomic::AtomicBool);
+
+impl Drop for FreeListGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+impl FreeListAllocator {
+    fn lock_list(&self) -> FreeListGuard<'_> {
+        use core::sync::atomic::Ordering;
+        while self
+            .list_locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        FreeListGuard(&self.list_locked)
+    }
+}
+
 unsafe impl GlobalAlloc for FreeListAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // Ensure block is at least large enough to hold a FreeBlock header (for future dealloc)
@@ -119,7 +144,48 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         // TODO: Step 2 — no suitable block in free_list, allocate from bump region
         //
         // Same logic as 02_bump_allocator's alloc
-        todo!()
+        use core::sync::atomic::Ordering;
+        let _guard = self.lock_list();
+        let mut previous: *mut FreeBlock = null_mut();
+        let mut current = self.free_list_head();
+        while !current.is_null() {
+            // SAFETY: The list is locked; each header is in a previously freed block.
+            let block = unsafe { &*current };
+            if (current as usize) % align == 0 && block.size >= size {
+                let next = block.next;
+                if previous.is_null() {
+                    self.set_free_list_head(next);
+                } else {
+                    // SAFETY: previous is another live header protected by the same lock.
+                    unsafe { (*previous).next = next };
+                }
+                return current.cast();
+            }
+            previous = current;
+            current = block.next;
+        }
+        let mut next = self.bump_next.load(Ordering::SeqCst);
+        loop {
+            let Some(aligned) = next
+                .checked_add(align - 1)
+                .map(|value| value & !(align - 1))
+            else {
+                return null_mut();
+            };
+            let Some(end) = aligned.checked_add(size) else {
+                return null_mut();
+            };
+            if end > self.heap_end {
+                return null_mut();
+            }
+            match self
+                .bump_next
+                .compare_exchange(next, end, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => return aligned as *mut u8,
+                Err(actual) => next = actual,
+            }
+        }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -131,7 +197,17 @@ unsafe impl GlobalAlloc for FreeListAllocator {
         // 1. Cast ptr to *mut FreeBlock
         // 2. Write FreeBlock { size, next: current list head }
         // 3. Update free_list head to ptr
-        todo!()
+        let _guard = self.lock_list();
+        let block = ptr.cast::<FreeBlock>();
+        // SAFETY: alloc reserves enough aligned storage for this header, and the
+        // caller transfers exclusive ownership of the freed allocation back to us.
+        unsafe {
+            block.write(FreeBlock {
+                size,
+                next: self.free_list_head(),
+            })
+        };
+        self.set_free_list_head(block);
     }
 }
 
